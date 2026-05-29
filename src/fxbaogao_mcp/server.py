@@ -9,6 +9,11 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 
 
+USER_AGENT = "fxbaogao-mcp/1.0.2"
+PDF_URL_KEYS = {"pdfurl", "url", "fileurl", "downloadurl"}
+RELATIVE_PDF_URL_KEYS = PDF_URL_KEYS | {"data"}
+
+
 class Settings:
     """应用配置"""
 
@@ -38,7 +43,7 @@ def _headers(accept: str = "application/json") -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {_api_key()}",
         "Accept": accept,
-        "User-Agent": "fxbaogao-mcp/0.1.4",
+        "User-Agent": USER_AGENT,
     }
 
 
@@ -80,21 +85,23 @@ def _add_report_urls(result: Any) -> Any:
     for report in reports:
         if not isinstance(report, dict):
             continue
-        report_id = report.get("reportId", report.get("docId"))
+        report_id = report.get("reportId")
         if report_id is not None:
             report["reportUrl"] = f"https://www.fxbaogao.com/view?id={report_id}"
 
     return result
 
 
-def _require_report_id(report_id: Optional[int] = None, doc_id: Optional[int] = None, id: Optional[int] = None) -> int:
-    value = report_id if report_id is not None else doc_id if doc_id is not None else id
-    if value is None:
-        raise RuntimeError("Missing reportId")
+def _coerce_report_id(value: int) -> int:
     try:
         return int(value)
     except (TypeError, ValueError) as exc:
         raise RuntimeError("reportId must be an integer") from exc
+
+
+def _looks_like_pdf_reference(value: str) -> bool:
+    lowered = value.lower()
+    return lowered.startswith(("http://", "https://", "/")) or ".pdf" in lowered
 
 
 def _normalize_pdf_url(value: str) -> Optional[str]:
@@ -113,12 +120,13 @@ def _extract_pdf_urls(data: Any) -> List[Dict[str, str]]:
         if isinstance(value, dict):
             for key, child in value.items():
                 lowered = str(key).lower()
-                if lowered in ("data", "pdfurl", "url", "fileurl", "downloadurl") and isinstance(child, str):
+                if not isinstance(child, str):
+                    walk(child)
+                    continue
+                if lowered in PDF_URL_KEYS or (lowered in RELATIVE_PDF_URL_KEYS and _looks_like_pdf_reference(child)):
                     normalized = _normalize_pdf_url(child)
                     if normalized:
                         urls.append({"field": str(key), "url": normalized})
-                else:
-                    walk(child)
         elif isinstance(value, list):
             for item in value:
                 walk(item)
@@ -155,42 +163,29 @@ def _ensure_under_workspace(output_dir: str) -> Path:
 
 @app.tool(
     name="search_reports",
-    description="""搜索发现报告研报。新接口通过 /mofoun/agent/search 完成，需要设置 FXBAOGAO_API_KEY。
+    description="""按关键词、机构、时间范围搜索发现报告研报。
 
-参数说明：
-- keywords: 搜索关键词，关键词和机构至少提供一个
-- org_names/orgNames: 机构名称列表，如 ["中信证券", "华泰证券"]
-- start_time/startTime/time: 开始时间，支持毫秒时间戳字符串或 last3day、last7day、last1mon、last3mon、last1year
-- end_time/endTime: 结束时间，毫秒时间戳字符串
-- authors/page_size: 兼容旧参数；新 agent/search 接口不再使用
+keywords string 搜索关键词
+orgNames string[] 机构列表
+startTime string 如 last7day、last1mon、last3mon、last1year，或毫秒时间戳字符串
+endTime string 结束时间戳，毫秒
 """
 )
 async def search_reports(
     keywords: Optional[str] = None,
-    authors: Optional[List[str]] = None,
-    org_names: Optional[List[str]] = None,
     orgNames: Optional[List[str]] = None,
-    start_time: Optional[Union[int, str]] = None,
     startTime: Optional[Union[int, str]] = None,
-    end_time: Optional[Union[int, str]] = None,
     endTime: Optional[Union[int, str]] = None,
-    time: Optional[str] = None,
-    page_size: Optional[int] = None,
 ) -> str:
-    _ = authors, page_size
     body: Dict[str, Any] = {
         "keywords": keywords or "",
-        "orgNames": orgNames if orgNames is not None else org_names or [],
+        "orgNames": orgNames or [],
     }
 
-    resolved_start_time = startTime if startTime is not None else start_time
-    resolved_end_time = endTime if endTime is not None else end_time
-    if resolved_start_time is not None:
-        body["startTime"] = _string_or_none(resolved_start_time)
-    elif time is not None:
-        body["startTime"] = time
-    if resolved_end_time is not None:
-        body["endTime"] = _string_or_none(resolved_end_time)
+    if startTime is not None:
+        body["startTime"] = _string_or_none(startTime)
+    if endTime is not None:
+        body["endTime"] = _string_or_none(endTime)
 
     result = await _request_json("POST", "/mofoun/agent/search", body)
     return json.dumps(_add_report_urls(result), ensure_ascii=False)
@@ -198,55 +193,37 @@ async def search_reports(
 
 @app.tool(
     name="get_paragraphs",
-    description="""根据报告 ID 和关键词获取摘要与命中正文段落。
+    description="""使用 search_reports 返回的 reportId 获取指定报告的摘要、目录和正文命中段落，reportId 必传。
 
-参数说明：
-- report_id/reportId/doc_id/id: 报告 ID
-- keyword: 用于命中上下文的关键词
+reportId integer 报告 ID
+keyword string 用于命中上下文的关键词
 """
 )
 async def get_paragraphs(
+    reportId: int,
     keyword: str,
-    report_id: Optional[int] = None,
-    reportId: Optional[int] = None,
-    doc_id: Optional[int] = None,
-    id: Optional[int] = None,
 ) -> str:
-    resolved_report_id = _require_report_id(
-        report_id=reportId if reportId is not None else report_id,
-        doc_id=doc_id,
-        id=id,
-    )
     result = await _request_json(
         "POST",
         "/mofoun/agent/paragraph",
-        {"reportId": resolved_report_id, "keyword": keyword},
+        {"reportId": reportId, "keyword": keyword},
     )
     return json.dumps(result, ensure_ascii=False)
 
 
 @app.tool(
     name="get_pdf_url",
-    description="""根据报告 ID 获取 PDF 下载地址。
+    description="""使用 search_reports 返回的 reportId 获取报告 PDF 地址，reportId 必传。
 
-参数说明：
-- report_id/reportId/doc_id/id: 报告 ID
+reportId integer 报告 ID
 """
 )
 async def get_pdf_url(
-    report_id: Optional[int] = None,
-    reportId: Optional[int] = None,
-    doc_id: Optional[int] = None,
-    id: Optional[int] = None,
+    reportId: int,
 ) -> str:
-    resolved_report_id = _require_report_id(
-        report_id=reportId if reportId is not None else report_id,
-        doc_id=doc_id,
-        id=id,
-    )
-    result = await _request_json("GET", f"/mofoun/agent/download?reportId={quote(str(resolved_report_id))}")
+    result = await _request_json("GET", f"/mofoun/agent/download?reportId={quote(str(reportId))}")
     payload = {
-        "reportId": resolved_report_id,
+        "reportId": reportId,
         "resources": _extract_pdf_urls(result),
         "raw": result,
     }
@@ -258,30 +235,23 @@ async def get_pdf_url(
     description="""根据报告 ID 下载 PDF 到本地工作区。
 
 参数说明：
-- report_id/reportId/doc_id/id: 报告 ID
-- output_dir: 相对 workspace 的输出目录，默认 intermediate/downloads
+- reportId: 报告 ID
+- output_dir: 相对 workspace 的输出目录，默认 downloads
 - filename: 保存文件名，默认 <reportId>.pdf
 - overwrite: 文件存在时是否覆盖
 """
 )
 async def download_pdf(
-    report_id: Optional[int] = None,
-    reportId: Optional[int] = None,
-    doc_id: Optional[int] = None,
-    id: Optional[int] = None,
-    output_dir: str = "intermediate/downloads",
+    reportId: int,
+    output_dir: str = "downloads",
     filename: Optional[str] = None,
     overwrite: bool = False,
 ) -> str:
-    resolved_report_id = _require_report_id(
-        report_id=reportId if reportId is not None else report_id,
-        doc_id=doc_id,
-        id=id,
-    )
+    report_id = _coerce_report_id(reportId)
     target_dir = _ensure_under_workspace(output_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    target_filename = _sanitize_filename(filename or f"{resolved_report_id}.pdf")
+    target_filename = _sanitize_filename(filename or f"{report_id}.pdf")
     if not target_filename.lower().endswith(".pdf"):
         target_filename += ".pdf"
     target_path = target_dir / target_filename
@@ -289,7 +259,7 @@ async def download_pdf(
     if target_path.exists() and not overwrite:
         return json.dumps(
             {
-                "reportId": resolved_report_id,
+                "reportId": report_id,
                 "path": str(target_path),
                 "size": target_path.stat().st_size,
                 "skipped": True,
@@ -298,15 +268,15 @@ async def download_pdf(
             ensure_ascii=False,
         )
 
-    pdf_info = json.loads(await get_pdf_url(reportId=resolved_report_id))
+    pdf_info = json.loads(await get_pdf_url(reportId=report_id))
     resources = pdf_info.get("resources") or []
     if not resources:
-        raise RuntimeError(f"No PDF URL found for reportId {resolved_report_id}")
+        raise RuntimeError(f"No PDF URL found for reportId {report_id}")
 
     pdf_url = resources[0]["url"]
     headers = _headers("application/pdf,*/*") if settings.API_BASE_URL in pdf_url else {
         "Accept": "application/pdf,*/*",
-        "User-Agent": "fxbaogao-mcp/0.1.4",
+        "User-Agent": USER_AGENT,
     }
     tmp_path = target_path.with_suffix(target_path.suffix + ".tmp")
     try:
@@ -324,7 +294,7 @@ async def download_pdf(
 
     return json.dumps(
         {
-            "reportId": resolved_report_id,
+            "reportId": report_id,
             "path": str(target_path),
             "size": target_path.stat().st_size,
             "pdfUrl": pdf_url,
