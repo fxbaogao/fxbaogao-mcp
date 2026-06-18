@@ -91,6 +91,8 @@ https://www.fxbaogao.com/view?id=<reportId>
 
 使用 `search_reports` 返回的 `reportId` 获取报告 PDF 地址，`reportId` 必传。
 
+注：会扣取发现报告的下载权益数量
+
 | 参数 | 类型 | 说明 |
 | --- | --- | --- |
 | `reportId` | integer | 报告 ID |
